@@ -13,7 +13,8 @@
 - macOS
 - Python 3.11+
 - Homebrew
-- 必要なツール: unpaper, py-reform, opencv-python, numpy
+- 必要なツール: unpaper, py-reform, opencv-python, numpy, Pillow
+- 自動指除去を利用する場合: mediapipe, （推奨）simple-lama-inpainting
 
 ## インストール
 
@@ -25,7 +26,7 @@ brew install python@3.11
 brew install unpaper
 
 # Pythonライブラリのインストール
-python3.11 -m pip install py-reform opencv-python numpy
+python3.11 -m pip install py-reform opencv-python numpy Pillow mediapipe simple-lama-inpainting
 ```
 
 ## ツール一覧
@@ -50,13 +51,18 @@ python3.11 complete_workflow.py --input scan.jpg --output result.jpg --device mp
 #### 指除去を含める場合
 
 ```shell
-# マスク画像を指定して指除去を実行
+# 自動指検出＋LaMaで高品質除去
+python3.11 complete_workflow.py --input scan.jpg --output result.jpg --auto-finger --inpaint-method lama
+
+# マスク画像を指定して指除去を実行（従来方式）
 python3.11 complete_workflow.py --input scan.jpg --output result.jpg --mask finger_mask.png
 ```
 
 **マスク画像の作成方法**:
 - GIMPやPhotoshopなどの画像編集ソフトを使用
 - 指の部分を**白**、それ以外を**黒**で塗りつぶす
+
+> **備考**: JPEGやHEICなどUnpaper非対応形式を指定した場合でも、自動でPNGに変換してから処理します。
 
 ### 2. インタラクティブ指除去ツール (`interactive_inpaint.py`)
 

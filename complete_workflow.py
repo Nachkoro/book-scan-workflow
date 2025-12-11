@@ -12,6 +12,7 @@
 """
 
 import argparse
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -20,10 +21,11 @@ try:
     from py_reform import straighten
     import cv2
     import numpy as np
+    from PIL import Image
 except ImportError as e:
     print(f"エラー: 必要なライブラリがインストールされていません: {e}")
     print("\n以下のコマンドでインストールしてください:")
-    print("  pip install py-reform opencv-python numpy")
+    print("  pip install py-reform opencv-python numpy Pillow")
     sys.exit(1)
 
 # MediaPipe（自動指検出用、オプション）
@@ -32,7 +34,7 @@ try:
     import mediapipe as mp
     MEDIAPIPE_AVAILABLE = True
 except ImportError:
-    pass
+    mp = None
 
 # LaMa（高品質インペインティング用、オプション）
 LAMA_AVAILABLE = False
@@ -53,7 +55,14 @@ def check_unpaper():
         return False
 
 
-def run_unpaper(input_path, output_path, layout='single'):
+def run_unpaper(
+    input_path,
+    output_path,
+    layout='single',
+    safe_mode=False,
+    extra_args=None,
+    white_threshold=None,
+):
     """
     Unpaperで前処理を実行
     
@@ -64,7 +73,23 @@ def run_unpaper(input_path, output_path, layout='single'):
     """
     print(f"[1/3] Unpaper実行中... (layout={layout})")
     
-    cmd = ['unpaper', '--layout', layout, str(input_path), str(output_path)]
+    cmd = ['unpaper', '--layout', layout, '--overwrite']
+
+    if safe_mode:
+        cmd.extend([
+            '--no-mask-scan',
+            '--no-blackfilter',
+            '--no-grayfilter',
+            '--no-border-scan',
+        ])
+
+    if white_threshold is not None:
+        cmd.extend(['--white-threshold', str(white_threshold)])
+
+    if extra_args:
+        cmd.extend(shlex.split(extra_args))
+
+    cmd.extend([str(input_path), str(output_path)])
     
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -73,6 +98,29 @@ def run_unpaper(input_path, output_path, layout='single'):
     except subprocess.CalledProcessError as e:
         print(f"  ✗ Unpaperエラー: {e.stderr}")
         return False
+
+
+def convert_to_png_if_needed(input_path: Path, temp_dir: Path):
+    """必要に応じて入力画像をPNGへ変換"""
+
+    allowed_ext = {'.png', '.tif', '.tiff', '.pbm', '.pgm', '.ppm'}
+    suffix = input_path.suffix.lower()
+
+    if suffix in allowed_ext:
+        return input_path
+
+    converted_path = temp_dir / 'converted_input.png'
+    try:
+        img = Image.open(input_path)
+        if img.mode not in ('RGB', 'RGBA'):
+            img = img.convert('RGB')
+        converted_path.parent.mkdir(parents=True, exist_ok=True)
+        img.save(converted_path, format='PNG')
+        print(f"[0/3] 入力をPNGに変換しました -> {converted_path}")
+        return converted_path
+    except Exception as e:
+        print(f"[0/3] PNG変換に失敗しました（元ファイルを使用します）: {e}")
+        return input_path
 
 
 def run_py_reform(input_path, output_path, model='uvdoc', device='cpu'):
@@ -100,7 +148,55 @@ def run_py_reform(input_path, output_path, model='uvdoc', device='cpu'):
         return False
 
 
-def detect_fingers(image, margin=30, min_confidence=0.5):
+def _segment_hands_with_selfie(image, threshold=0.45):
+    if not MEDIAPIPE_AVAILABLE or not hasattr(mp.solutions, 'selfie_segmentation'):
+        return None
+
+    segmenter = mp.solutions.selfie_segmentation.SelfieSegmentation(model_selection=1)
+    try:
+        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        result = segmenter.process(rgb_image)
+        if result.segmentation_mask is None:
+            return None
+
+        mask = (result.segmentation_mask > threshold).astype(np.uint8) * 255
+
+        skin_mask = _detect_skin_via_color(image, skip_cleanup=True)
+        if skin_mask is not None:
+            mask = cv2.bitwise_and(mask, skin_mask)
+
+        h, w = mask.shape[:2]
+        edge_mask = np.zeros_like(mask)
+        margin_w = max(10, int(w * 0.18))
+        margin_h = max(10, int(h * 0.18))
+        edge_mask[:, :margin_w] = 255
+        edge_mask[:, -margin_w:] = 255
+        edge_mask[-margin_h:, :] = 255
+        mask = cv2.bitwise_and(mask, edge_mask)
+
+        mask = cv2.medianBlur(mask, 5)
+        mask = cv2.dilate(mask, np.ones((11, 11), np.uint8), iterations=1)
+
+        return mask if np.count_nonzero(mask) > 0 else None
+    finally:
+        segmenter.close()
+
+
+def _detect_skin_via_color(image, skip_cleanup=False):
+    ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+    lower = np.array([0, 133, 77])
+    upper = np.array([255, 173, 135])
+    mask = cv2.inRange(ycrcb, lower, upper)
+
+    if skip_cleanup:
+        return mask if np.count_nonzero(mask) > 0 else None
+
+    mask = cv2.medianBlur(mask, 5)
+    mask = cv2.dilate(mask, np.ones((9, 9), np.uint8), iterations=1)
+    return mask if np.count_nonzero(mask) > 500 else None
+
+
+def detect_fingers(image, margin=30, min_confidence=0.5, seg_threshold=0.45):
     """
     MediaPipeで指/手を自動検出してマスクを生成
 
@@ -119,39 +215,53 @@ def detect_fingers(image, margin=30, min_confidence=0.5):
     h, w = image.shape[:2]
     mask = np.zeros((h, w), dtype=np.uint8)
 
-    hands = mp.solutions.hands.Hands(
-        static_image_mode=True,
-        max_num_hands=4,
-        min_detection_confidence=min_confidence
-    )
+    detected = False
 
-    try:
-        rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        results = hands.process(rgb_image)
+    if MEDIAPIPE_AVAILABLE and mp is not None:
+        hands = mp.solutions.hands.Hands(
+            static_image_mode=True,
+            max_num_hands=4,
+            min_detection_confidence=min_confidence,
+        )
 
-        if not results.multi_hand_landmarks:
-            return mask, False
+        try:
+            rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            results = hands.process(rgb_image)
 
-        for hand_landmarks in results.multi_hand_landmarks:
-            points = []
-            for landmark in hand_landmarks.landmark:
-                x = int(landmark.x * w)
-                y = int(landmark.y * h)
-                points.append([x, y])
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    points = []
+                    for landmark in hand_landmarks.landmark:
+                        x = int(landmark.x * w)
+                        y = int(landmark.y * h)
+                        points.append([x, y])
 
-            points = np.array(points, dtype=np.int32)
-            hull = cv2.convexHull(points)
-            cv2.fillConvexPoly(mask, hull, 255)
+                    points = np.array(points, dtype=np.int32)
+                    hull = cv2.convexHull(points)
+                    cv2.fillConvexPoly(mask, hull, 255)
 
-            for point in points:
-                cv2.circle(mask, tuple(point), margin, 255, -1)
+                    for point in points:
+                        cv2.circle(mask, tuple(point), margin, 255, -1)
 
-        kernel = np.ones((margin, margin), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=1)
+                kernel = np.ones((margin, margin), np.uint8)
+                mask = cv2.dilate(mask, kernel, iterations=1)
+                detected = True
+        finally:
+            hands.close()
 
-        return mask, True
-    finally:
-        hands.close()
+    if not detected:
+        selfie_mask = _segment_hands_with_selfie(image, threshold=seg_threshold)
+        if selfie_mask is not None:
+            mask = selfie_mask
+            detected = True
+
+    if not detected:
+        color_mask = _detect_skin_via_color(image)
+        if color_mask is not None:
+            mask = color_mask
+            detected = True
+
+    return mask, detected
 
 
 def inpaint_with_lama(image, mask):
@@ -222,7 +332,14 @@ def run_inpainting(input_path, mask_path, output_path, radius=3, method='telea')
         return False
 
 
-def run_auto_finger_removal(input_path, output_path, method='auto', margin=30):
+def run_auto_finger_removal(
+    input_path,
+    output_path,
+    method='auto',
+    margin=30,
+    seg_threshold=0.45,
+    min_confidence=0.5,
+):
     """
     自動指検出・除去を実行
 
@@ -246,7 +363,12 @@ def run_auto_finger_removal(input_path, output_path, method='auto', margin=30):
             return False
 
         # 指を検出
-        mask, detected = detect_fingers(img, margin=margin)
+        mask, detected = detect_fingers(
+            img,
+            margin=margin,
+            min_confidence=min_confidence,
+            seg_threshold=seg_threshold,
+        )
 
         if not detected:
             print("  ! 指が検出されませんでした。元の画像を使用します。")
@@ -322,10 +444,22 @@ def main():
     parser.add_argument('--inpaint-method', choices=['auto', 'lama', 'opencv'],
                        default='auto',
                        help='インペインティング方法 (default: auto)')
+    parser.add_argument('--auto-finger-margin', type=int, default=45,
+                       help='自動指検出時に膨張させるピクセル幅 (default: 45)')
+    parser.add_argument('--finger-seg-threshold', type=float, default=0.45,
+                       help='SelfieSegmentationの閾値 (default: 0.45)')
+    parser.add_argument('--finger-min-confidence', type=float, default=0.5,
+                       help='MediaPipe Handsの最小検出信頼度 (default: 0.5)')
     parser.add_argument('--skip-unpaper', action='store_true',
                        help='Unpaperをスキップ')
     parser.add_argument('--skip-reform', action='store_true',
                        help='py-reformをスキップ')
+    parser.add_argument('--unpaper-safe', action='store_true', default=True,
+                       help='Unpaperの破壊的フィルタを無効化（デフォルトで有効）')
+    parser.add_argument('--unpaper-extra', type=str, default=None,
+                       help='Unpaperに渡す追加オプション（例: "--deskew-scan ON"）')
+    parser.add_argument('--unpaper-white-threshold', type=int, default=None,
+                       help='白レベルのしきい値 (0-255)。指定しない場合はデフォルト値')
     
     args = parser.parse_args()
     
@@ -357,7 +491,7 @@ def main():
         print(f"マスク: {args.mask}")
     print("=" * 60)
     
-    current_file = args.input
+    current_file = convert_to_png_if_needed(args.input, temp_dir)
     
     # ステップ1: Unpaper
     if not args.skip_unpaper:
@@ -366,7 +500,14 @@ def main():
             print("  brew install unpaper でインストールしてください")
             print("  Unpaperをスキップします...")
         else:
-            if run_unpaper(current_file, temp_unpaper, args.layout):
+            if run_unpaper(
+                current_file,
+                temp_unpaper,
+                layout=args.layout,
+                safe_mode=args.unpaper_safe,
+                extra_args=args.unpaper_extra,
+                white_threshold=args.unpaper_white_threshold,
+            ):
                 current_file = temp_unpaper
     else:
         print("[1/3] Unpaper: スキップ")
@@ -381,8 +522,14 @@ def main():
     # ステップ3: 指除去（オプション）
     if args.auto_finger:
         # 自動指検出・除去
-        run_auto_finger_removal(current_file, args.output,
-                               method=args.inpaint_method)
+        run_auto_finger_removal(
+            current_file,
+            args.output,
+            method=args.inpaint_method,
+            margin=args.auto_finger_margin,
+            seg_threshold=args.finger_seg_threshold,
+            min_confidence=args.finger_min_confidence,
+        )
     elif args.mask:
         # マスク指定での指除去（従来方式）
         if not args.mask.exists():
